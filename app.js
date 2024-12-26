@@ -9,7 +9,8 @@ const { saveOtp, verifyOtp } = require('./otpStorage');
 const mongoose = require('mongoose');
 const User = require('./models/Users');
 const port = process.env.PORT || 3001;
-
+const { ethers } = require("ethers");
+const abi = require("./faucet_abi.json")
 // Connect to MongoDB
 mongoose
   .connect(process.env.MONGO_DB_ATLAS_CLUSTER_URI, { useNewUrlParser: true, useUnifiedTopology: true })
@@ -80,6 +81,37 @@ function validateRequest(req, res, next) {
   next();
 }
 
+
+//Request Faucet
+
+async function claimFaucet(userAdd) {
+  try {
+    // Connect to the Ethereum provider
+    providerUrl = process.env.RPC_URL
+    privateKey = process.env.WALLET_PRIVATE_KEY;
+    contractAddress = process.env.CONTRACT_ADDRESS;
+    const provider = new ethers.JsonRpcProvider(providerUrl);
+
+    // Create a wallet instance
+    const wallet = new ethers.Wallet(privateKey, provider);
+
+
+    // Connect to the faucet contract
+    const contract = new ethers.Contract(contractAddress, abi, wallet);
+    console.log(abi)
+    // Call the claim function
+    const tx = await contract.claim(ethers.getAddress(userAdd));
+    console.log(`Transaction sent: ${tx.hash}`);
+
+    // Wait for the transaction to be mined
+    const receipt = await tx.wait();
+    console.log("Transaction confirmed:", receipt);
+  } catch (error) {
+    console.error("Error claiming faucet:", error);
+  }
+}
+
+
 // Request OTP with validation
 app.post(
   '/request-otp',
@@ -98,9 +130,12 @@ app.post(
 
     try {
       let user = await User.findOne({ email });
+
       if (!user) {
         user = new User({ name, email, walletAddress });
         await user.save();
+      } else {
+        res.status(400).json({ message: "user already registered" })
       }
 
       await sendOtpEmail(email, otp);
@@ -122,7 +157,7 @@ app.post(
   validateRequest,
   async (req, res) => {
     console.log("received request on /verify-otp", req.body)
-    const { email, otp } = req.body;
+    const { email, otp, userAdd } = req.body;
     const verificationResult = verifyOtp(email, otp);
     if (verificationResult === 'blocked') {
       return res.status(429).json({ error: 'Too many failed attempts. Please request a new OTP.' });
@@ -131,6 +166,7 @@ app.post(
     if (verificationResult) {
       try {
         await User.findOneAndUpdate({ email }, { isVerified: true });
+        await claimFaucet(userAdd);
         res.status(200).json({ message: 'Email verified successfully!' });
       } catch (error) {
         console.error(error);
