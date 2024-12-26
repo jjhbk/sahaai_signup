@@ -2,40 +2,145 @@ require('dotenv').config()
 const express = require("express");
 const app = express();
 const cors = require('cors');
-
+const bodyParser = require('body-parser');
+const nodemailer = require('nodemailer');
+const crypto = require('crypto'); // For secure OTP generation
+const { saveOtp, verifyOtp } = require('./otpStorage');
+const mongoose = require('mongoose');
+const User = require('./models/Users');
 const port = process.env.PORT || 3001;
-const OpenAI = require("openai");
+
+// Connect to MongoDB
+mongoose
+  .connect(process.env.MONGO_DB_ATLAS_CLUSTER_URI, { useNewUrlParser: true, useUnifiedTopology: true })
+  .then(() => console.log('MongoDB connected successfully!'))
+  .catch((error) => console.error('MongoDB connection failed:', error));
+
+
+
+app.use(bodyParser.json());
 app.use(express.json());
 app.use(cors())
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
+const rateLimit = require('express-rate-limit');
+
+// Define rate limit: max 5 requests per 15 minutes per IP
+const otpRequestLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 5,
+  message: 'Too many OTP requests from this IP, please try again after 15 minutes.',
+});
+
+// Apply rate limiter to the /request-otp route
+//app.post('/request-otp', otpRequestLimiter, /* existing middleware and handler */);
+
 app.get("/", (req, res) => {
-  console.log(req.body)
+  console.log("received request on /", req.body)
   res.type('html').send(html)
 });
 
-app.post("/api/generate-audio", async (req, res) => {
-  console.log("...generating audio")
-  const { input } = req.body;
-  console.log("input is:", input)
-  if (!input) {
-    return res.status(400).send("Input text is required");
-  }
-  try {
-    const audio_file = await openai.audio.speech.create({
-      model: "tts-1",
-      voice: "nova",
-      input: input,
-    });
-    const buffer = Buffer.from(await audio_file.arrayBuffer());
-    res.setHeader('Content-Type', 'audio/mpeg');
-    res.setHeader('Content-Disposition', 'attachment; filename="output.mp3"');
-    res.send(buffer);
 
-  } catch (error) {
-    console.error('Error generating audio:', error);
-    res.status(500).send(`Error processing request: ${error}`);
+
+// Create transporter with Namecheap SMTP settings
+const transporter = nodemailer.createTransport({
+  host: 'mail.privateemail.com', // Namecheap SMTP server
+  port: 465, // Port for TLS
+  secure: true, // Use false for TLS, true for SSL (465)
+  auth: {
+    user: process.env.EMAIL_ID, // Your Namecheap email
+    pass: process.env.PASSWORD, // Your email password
+  },
+  debug: true, // Enable debug output
+  logger: true, // Log information to console
+});
+
+// Generate a 6-digit OTP
+function generateOtp() {
+  return crypto.randomInt(100000, 999999).toString();
+}
+
+// Send OTP email
+async function sendOtpEmail(email, otp) {
+  const mailOptions = {
+    from: '"Sahaai" support@sahaaai.com',
+    to: email,
+    subject: 'Your OTP for Verification',
+    text: `Your OTP is: ${otp}. It is valid for 10 minutes.`,
+  };
+  await transporter.sendMail(mailOptions);
+  console.log('OTP email sent successfully!');
+}
+const { body, validationResult } = require('express-validator');
+
+// Middleware to check validation results
+function validateRequest(req, res, next) {
+  const errors = validationResult(req);
+  if (!errors.isEmpty()) {
+    return res.status(400).json({ errors: errors.array() });
   }
-})
+  next();
+}
+
+// Request OTP with validation
+app.post(
+  '/request-otp',
+  [
+    body('name').notEmpty().withMessage('Name is required'),
+    body('email').isEmail().withMessage('Invalid email format'),
+    body('walletAddress').matches(/^0x[a-fA-F0-9]{40}$/).withMessage('Invalid wallet address format'),
+  ],
+  validateRequest,
+  async (req, res) => {
+    const { name, email, walletAddress } = req.body;
+    console.log("received request on /request-otp", req.body)
+
+    const otp = generateOtp();
+    saveOtp(email, otp);
+
+    try {
+      let user = await User.findOne({ email });
+      if (!user) {
+        user = new User({ name, email, walletAddress });
+        await user.save();
+      }
+
+      await sendOtpEmail(email, otp);
+      res.status(200).json({ message: 'OTP sent successfully!' });
+    } catch (error) {
+      console.error(error);
+      res.status(500).json({ error: 'Failed to process request' });
+    }
+  }
+);
+
+// Verify OTP with validation
+app.post(
+  '/verify-otp',
+  [
+    body('email').isEmail().withMessage('Invalid email format'),
+    body('otp').isNumeric().isLength({ min: 6, max: 6 }).withMessage('Invalid OTP'),
+  ],
+  validateRequest,
+  async (req, res) => {
+    console.log("received request on /verify-otp", req.body)
+    const { email, otp } = req.body;
+    const verificationResult = verifyOtp(email, otp);
+    if (verificationResult === 'blocked') {
+      return res.status(429).json({ error: 'Too many failed attempts. Please request a new OTP.' });
+    }
+
+    if (verificationResult) {
+      try {
+        await User.findOneAndUpdate({ email }, { isVerified: true });
+        res.status(200).json({ message: 'Email verified successfully!' });
+      } catch (error) {
+        console.error(error);
+        res.status(500).json({ error: 'Failed to verify email' });
+      }
+    } else {
+      res.status(400).json({ error: 'Invalid or expired OTP' });
+    }
+  }
+);
 
 const server = app.listen(port, () => console.log(`Example app listening on port ${port}!`));
 
